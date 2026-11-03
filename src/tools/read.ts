@@ -325,7 +325,7 @@ export function registerReadTools(
       title: 'List and search messages',
       description:
         'Lists messages newest first, optionally narrowed by sender, recipient, ' +
-        'subject, body text, date range or flags. With no criteria it simply ' +
+        'subject, body text, date range, flags or a native Gmail query. With no criteria it simply ' +
         'pages through the mailbox. Every filter is applied by the mail server, ' +
         'so searching a large folder is cheap. Returns summaries only — use ' +
         'get_message for the body.',
@@ -341,6 +341,14 @@ export function registerReadTools(
         body: searchTextParam.describe(
           'Substring to match in the message body.'
         ),
+        gmail_query: searchTextParam
+          .refine(
+            (value) => value === undefined || value.trim().length > 0,
+            'must not be blank'
+          )
+          .describe(
+            'Native Gmail search syntax, e.g. "has:attachment filename:pdf". Requires X-GM-EXT-1; combined with other filters using AND, within the selected mailbox.'
+          ),
         since: dateParam.describe(
           'Only messages received on or after this date (YYYY-MM-DD).'
         ),
@@ -383,6 +391,14 @@ export function registerReadTools(
         const limit = args.limit ?? client.maxMessages;
         const offset = args.offset ?? 0;
         return client.withMailbox(args.mailbox, true, async (connection) => {
+          if (
+            args.gmail_query !== undefined &&
+            !connection.capabilities.has('X-GM-EXT-1')
+          ) {
+            throw new ToolInputError(
+              'imap-mcp: gmail_query requires a server advertising X-GM-EXT-1. Use the standard search filters on this server.'
+            );
+          }
           const query = buildSearch(args);
           const uids = (await client.search(connection, query)).toSorted(
             (a, b) => b - a
@@ -567,6 +583,7 @@ export function registerReadTools(
           const message = await fetchOne(connection, uid, {
             uid: true,
             envelope: true,
+            threadId: include_thread === true,
             bodyStructure: true,
             source: { maxLength: MAX_SOURCE_BYTES },
           });
@@ -603,7 +620,12 @@ export function registerReadTools(
 
           const thread =
             include_thread === true
-              ? await threadSummaries(client, connection, rendered)
+              ? await threadSummaries(
+                  client,
+                  connection,
+                  rendered,
+                  message.threadId
+                )
               : undefined;
 
           // The budgeted *value*, used for both channels. The text block used
@@ -1022,6 +1044,7 @@ function buildSearch(args: {
   to?: string | undefined;
   subject?: string | undefined;
   body?: string | undefined;
+  gmail_query?: string | undefined;
   since?: string | undefined;
   before?: string | undefined;
   seen?: boolean | undefined;
@@ -1033,6 +1056,7 @@ function buildSearch(args: {
   if (args.to !== undefined) query.to = args.to;
   if (args.subject !== undefined) query.subject = args.subject;
   if (args.body !== undefined) query.body = args.body;
+  if (args.gmail_query !== undefined) query.gmraw = args.gmail_query;
   if (args.since !== undefined)
     query.since = new Date(`${args.since}T00:00:00Z`);
   if (args.before !== undefined)
@@ -1045,36 +1069,32 @@ function buildSearch(args: {
   return query;
 }
 
-/**
- * Finds the other messages of a conversation.
- *
- * Threading is reconstructed from the References chain rather than from a
- * server extension, because OBJECTID/X-GM-EXT-1 are far from universal. The
- * number of terms is capped: a long thread carries dozens of ids and each one
- * becomes a header search.
- */
+/** Finds conversation summaries in the selected mailbox. */
 async function threadSummaries(
   client: ImapClient,
   connection: ImapConnection,
   rendered: {
     metadata: { messageId: string | undefined; references: string[] };
-  }
+  },
+  threadId: string | undefined
 ): Promise<MessageSummary[]> {
-  // The whole chain, not just this message's own id: a reply three levels down
-  // references its ancestors, and searching only for the current id finds the
-  // direct answers to it and nothing else.
-  const ids = threadIdsOf({
-    messageId: rendered.metadata.messageId,
-    references: rendered.metadata.references,
-  }).slice(0, MAX_THREAD_TERMS);
-  if (ids.length === 0) return [];
-  const uids = await client.search(connection, {
-    or: ids.flatMap((id) => [
-      { header: { 'message-id': id } },
-      { header: { references: id } },
-      { header: { 'in-reply-to': id } },
-    ]),
-  });
+  let uids: number[];
+  if (connection.capabilities.has('X-GM-EXT-1') && threadId !== undefined) {
+    uids = await client.search(connection, { threadId });
+  } else {
+    const ids = threadIdsOf({
+      messageId: rendered.metadata.messageId,
+      references: rendered.metadata.references,
+    }).slice(0, MAX_THREAD_TERMS);
+    if (ids.length === 0) return [];
+    uids = await client.search(connection, {
+      or: ids.flatMap((id) => [
+        { header: { 'message-id': id } },
+        { header: { references: id } },
+        { header: { 'in-reply-to': id } },
+      ]),
+    });
+  }
   const messages = await client.fetchSummaries(
     connection,
     uids.slice(0, MAX_THREAD_TERMS * 10)
